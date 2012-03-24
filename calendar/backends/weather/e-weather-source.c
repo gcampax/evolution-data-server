@@ -19,43 +19,105 @@
  */
 
 #include "e-weather-source.h"
-#include "e-weather-source-ccf.h"
 
 #include <string.h>
 
 G_DEFINE_TYPE (EWeatherSource, e_weather_source, G_TYPE_OBJECT)
 
+static void
+parse_done (GWeatherInfo *info,
+            gpointer data)
+{
+	EWeatherSource *source = (EWeatherSource *) data;
+
+	if (!source)
+		return;
+
+	if (!info || !gweather_info_is_valid (info)) {
+		source->done (NULL, source->finished_data);
+		return;
+	}
+
+	source->done (info, source->finished_data);
+}
+
 void
 e_weather_source_parse (EWeatherSource *source,
-                        EWeatherSourceFinished done,
-                        gpointer data)
+			EWeatherSourceFinished done,
+			gpointer data)
 {
-	EWeatherSourceClass *class;
+	source->finished_data = data;
+	source->done = done;
 
-	g_return_if_fail (source != NULL);
-
-	class = E_WEATHER_SOURCE_GET_CLASS (source);
-	g_return_if_fail (class->parse != NULL);
-
-	class->parse (source, done, data);
+	if (!source->info) {
+		source->info = gweather_info_new (source->location, GWEATHER_FORECAST_LIST);
+		g_signal_connect (source->info, "updated", G_CALLBACK (parse_done), source);
+	} else {
+		gweather_info_update (source->info);
+	}
 }
 
 static void
-e_weather_source_class_init (EWeatherSourceClass *class)
+e_weather_source_finalize (GObject *object)
 {
-	/* nothing to do here */
+	EWeatherSource *self = (EWeatherSource*) object;
+
+	if (self->location)
+		gweather_location_unref (self->location);
+	g_clear_object (&self->info);
+
+	G_OBJECT_CLASS (e_weather_source_parent_class)->finalize (object);
+}
+
+static void
+e_weather_source_class_init (EWeatherSourceClass *klass)
+{
+	GObjectClass *gobject_class;
+
+	gobject_class = G_OBJECT_CLASS (klass);
+	gobject_class->finalize = e_weather_source_finalize;
 }
 
 static void
 e_weather_source_init (EWeatherSource *source)
 {
-	/* nothing to do here */
 }
 
 EWeatherSource *
 e_weather_source_new (const gchar *uri)
 {
-	const gchar *base = uri + 10; /* skip weather:// */
+	const gchar *base;
+	GWeatherLocation *world, *location;
+	EWeatherSource *source;
 
-	return e_weather_source_ccf_new (base);
+	/* Old URI is formatted as weather://ccf/AAA[/BBB] - AAA is the 3-letter station
+	 * code for identifying the providing station (subdirectory within the crh data
+	 * repository). BBB is an optional additional station ID for the station within
+	 * the CCF file. If not present, BBB is assumed to be the same station as AAA.
+	 * But the new URI is as weather://code/name, where code is 4-letter code.
+	 * So if got the old URI, then migrate to the new one, if possible.
+	 */
+
+	base = uri + 10; /* skip weather:// */
+
+	if (!uri)
+		return NULL;
+
+	world = gweather_location_new_world (FALSE);
+	if (strncmp (base, "ccf/", 4) == 0)
+		location = gweather_location_find_by_station_code (world, base + 4);
+	else
+		location = gweather_location_find_by_station_code (world, base);
+	if (location)
+		gweather_location_ref (location);
+	gweather_location_unref (world);
+
+	if (!location)
+		return NULL;
+
+	source = E_WEATHER_SOURCE (g_object_new (e_weather_source_get_type (), NULL));
+	source->location = location;
+	source->info = NULL;
+
+	return source;
 }
